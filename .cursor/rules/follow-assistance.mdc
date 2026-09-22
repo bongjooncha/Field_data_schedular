@@ -1,0 +1,10 @@
+---
+description: Always follow project rules in assistance.md
+alwaysApply: true
+---
+
+# Follow assistance.md
+
+Before implementing a user request, read `assistance.md` at the project root and follow the rules written there.
+
+If `assistance.md` is empty or only a placeholder, proceed with the user's request as usual.
