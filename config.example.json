@@ -1,0 +1,31 @@
+{
+  "mongodb": {
+    "host": "127.0.0.1",
+    "port": 27017,
+    "username": "field_user",
+    "password": "",
+    "authSource": "admin",
+    "database": "field",
+    "collection": "sensors"
+  },
+  "timestampField": "createdAt",
+  "columns": ["temperature", "humidity"],
+  "schedule": {
+    "period": "daily",
+    "hour": 8,
+    "minute": 0,
+    "weekday": "mon",
+    "timezone": "Asia/Seoul"
+  },
+  "email": {
+    "to": ["ops@example.com"],
+    "smtpHost": "smtp.example.com",
+    "smtpPort": 587,
+    "smtpUser": "ops@example.com",
+    "smtpPassword": "",
+    "fromName": "DYP_Schedular",
+    "fromAddress": "ops@example.com",
+    "useTls": true
+  },
+  "setupComplete": false
+}
