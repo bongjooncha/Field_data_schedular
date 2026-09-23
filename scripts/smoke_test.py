@@ -71,6 +71,12 @@ def main() -> None:
         assert body["setupComplete"] is False
         assert body["config"]["mongodb"]["password"] == ""
         assert body["config"]["mongodb"]["passwordSet"] is True
+        assert body["config"]["activeSourceId"] == "primary"
+        assert body["config"]["sources"][0]["host"] == "10.0.0.8"
+        assert body["config"]["sources"][0]["password"] == ""
+        assert body["config"]["sources"][0]["passwordSet"] is True
+        removed = client.delete("/api/sources/primary")
+        assert removed.status_code == 400, removed.text
         failed = client.post(
             "/api/setup/connection",
             json={"host": "", "port": 27017, "username": "", "password": ""},
@@ -78,6 +84,18 @@ def main() -> None:
         assert failed.status_code == 400, failed.text
         assert "주소" in failed.json()["detail"]
         assert "s3cret-value" in TEMP.read_text(encoding="utf-8")
+        skipped = client.post(
+            "/api/setup/delivery",
+            json={"enabled": False, "to": [], "smtpHost": "", "fromAddress": ""},
+        )
+        assert skipped.status_code == 200, skipped.text
+        skipped_body = skipped.json()
+        assert skipped_body["status"]["config"]["email"]["enabled"] is False
+        assert skipped_body["status"]["setupComplete"] is True
+        assert skipped_body["status"]["nextRun"] is None
+        blocked = client.post("/api/report/send")
+        assert blocked.status_code == 400, blocked.text
+        assert "메일" in blocked.json()["detail"]
     print("smoke ok")
 
 

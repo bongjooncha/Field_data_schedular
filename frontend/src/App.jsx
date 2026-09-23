@@ -6,7 +6,7 @@ import Wizard from "./pages/Wizard";
 export default function App() {
   const [status, setStatus] = useState(null);
   const [error, setError] = useState("");
-  const [editing, setEditing] = useState(false);
+  const [mode, setMode] = useState("home");
 
   async function refresh() {
     const next = await getStatus();
@@ -33,15 +33,19 @@ export default function App() {
     );
   }
 
-  if (!status.setupComplete || editing) {
+  if (!status.setupComplete || mode === "settings" || mode === "add") {
+    const wizardMode = status.setupComplete ? mode : "setup";
     return (
       <Wizard
+        key={`${wizardMode}-${status.config.activeSourceId || "new"}`}
         status={status}
+        mode={wizardMode}
         onDone={async () => {
           await refresh();
-          setEditing(false);
+          setMode("home");
         }}
-        onCancel={status.setupComplete ? () => setEditing(false) : null}
+        onCancel={status.setupComplete ? () => setMode("home") : null}
+        onRefresh={refresh}
       />
     );
   }
@@ -49,7 +53,8 @@ export default function App() {
   return (
     <Dashboard
       status={status}
-      onEdit={() => setEditing(true)}
+      onEdit={() => setMode("settings")}
+      onAdd={() => setMode("add")}
       onStatus={setStatus}
     />
   );

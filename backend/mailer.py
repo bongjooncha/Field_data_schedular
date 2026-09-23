@@ -38,6 +38,10 @@ def _valid_email(value: str) -> bool:
     return bool(local and domain and "." in domain and " " not in value)
 
 
+def mail_enabled(config: dict) -> bool:
+    return bool(config.get("email", {}).get("enabled", True))
+
+
 def validate_delivery(email: dict) -> list[str]:
     recipients = normalize_recipients(email.get("to") or [])
     invalid = [item for item in recipients if not _valid_email(item)]
@@ -55,12 +59,19 @@ def validate_delivery(email: dict) -> list[str]:
 
 
 def _column_lines(report: dict) -> list[str]:
+    total = report.get("totalDocuments") or 0
     lines = []
     for row in report["columns"]:
-        rate = f"{row['fillRate'] * 100:.1f}%"
-        lines.append(
-            f"- {row['name']}: {row['present']:,}건 수집 / {row['missing']:,}건 누락 ({rate}, {STATUS_LABEL[row['status']]})"
-        )
+        lines.append(f"[{row['name']}]")
+        values = row.get("values") or []
+        if not values:
+            lines.append("- 값 없음")
+        for item in values:
+            share = f"{item['rate'] * 100:.1f}%" if total else "-"
+            lines.append(f"- {item['value']}: {item['count']:,}건 ({share})")
+        if row.get("valuesTruncated"):
+            lines.append("- 그 밖에도 값이 더 있습니다. 건수가 많은 순서로 40개만 표시했습니다.")
+        lines.append("")
     return lines
 
 
@@ -72,7 +83,7 @@ def render_text(report: dict) -> str:
         f"시간 컬럼: {report['timestampField']}",
         f"수집 문서: {report['totalDocuments']:,}건",
         "",
-        "컬럼별 수집",
+        "컬럼별 값과 건수",
         *_column_lines(report),
     ]
     if not report.get("timestampIndexed"):
@@ -80,19 +91,39 @@ def render_text(report: dict) -> str:
     return "\n".join(lines)
 
 
-def render_html(report: dict) -> str:
-    rows = []
-    for row in report["columns"]:
-        rate = f"{row['fillRate'] * 100:.1f}%"
-        rows.append(
+def _value_table(report: dict, row: dict) -> str:
+    total = report.get("totalDocuments") or 0
+    body = []
+    for item in row.get("values") or []:
+        share = f"{item['rate'] * 100:.1f}%" if total else "-"
+        body.append(
             "<tr>"
-            f"<td>{escape(row['name'])}</td>"
-            f"<td style='text-align:right'>{row['present']:,}</td>"
-            f"<td style='text-align:right'>{row['missing']:,}</td>"
-            f"<td style='text-align:right'>{rate}</td>"
-            f"<td>{STATUS_LABEL[row['status']]}</td>"
+            f"<td>{escape(str(item['value']))}</td>"
+            f"<td style='text-align:right'>{item['count']:,}</td>"
+            f"<td style='text-align:right'>{share}</td>"
             "</tr>"
         )
+    if not body:
+        body.append("<tr><td colspan='3'>값 없음</td></tr>")
+    note = ""
+    if row.get("valuesTruncated"):
+        note = "<p style='margin:8px 0 0'>건수가 많은 값 40개만 표시했습니다.</p>"
+    return f"""
+    <p style="margin:20px 0 8px;font-weight:700">{escape(row['name'])}</p>
+    <table cellpadding="8" cellspacing="0" style="border-collapse:collapse;min-width:420px">
+      <thead>
+        <tr style="background:#f6f5f4;text-align:left">
+          <th>값</th><th>건수</th><th>비율</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(body)}</tbody>
+    </table>
+    {note}
+    """
+
+
+def render_html(report: dict) -> str:
+    tables = "".join(_value_table(report, row) for row in report["columns"])
     index_note = ""
     if not report.get("timestampIndexed"):
         index_note = "<p>시간 컬럼에 인덱스가 없어 조회가 느릴 수 있습니다.</p>"
@@ -105,14 +136,7 @@ def render_html(report: dict) -> str:
         시간 컬럼 {escape(report['timestampField'])}<br>
         수집 문서 {report['totalDocuments']:,}건
       </p>
-      <table cellpadding="8" cellspacing="0" style="border-collapse:collapse;min-width:420px">
-        <thead>
-          <tr style="background:#f6f5f4;text-align:left">
-            <th>컬럼</th><th>수집</th><th>누락</th><th>채움률</th><th>상태</th>
-          </tr>
-        </thead>
-        <tbody>{''.join(rows)}</tbody>
-      </table>
+      {tables}
       {index_note}
     </div>
     """
@@ -161,6 +185,41 @@ def send_report(config: dict, report: dict) -> None:
     status = STATUS_LABEL[report["status"]]
     subject = f"[현장 데이터 점검] {report['window']['label']} — {status}"
     send_message(config, subject, render_text(report), render_html(report))
+
+
+def render_digest_text(reports: list[dict], skipped: list[dict]) -> str:
+    parts = []
+    for report in reports:
+        parts.extend([f"■ {report.get('sourceLabel') or report['database']}", render_text(report), ""])
+    for item in skipped:
+        parts.extend([f"■ {item.get('label') or '주소'}", f"오프라인: {item.get('error') or '연결하지 못했습니다.'}", ""])
+    return "\n".join(parts).strip()
+
+
+def render_digest_html(reports: list[dict], skipped: list[dict]) -> str:
+    blocks = []
+    for report in reports:
+        blocks.append(f"<h2 style='margin:28px 0 8px'>{escape(str(report.get('sourceLabel') or report['database']))}</h2>")
+        blocks.append(render_html(report))
+    for item in skipped:
+        blocks.append(
+            f"<h2 style='margin:28px 0 8px'>{escape(str(item.get('label') or '주소'))}</h2>"
+            f"<p>오프라인. {escape(str(item.get('error') or '연결하지 못했습니다.'))}</p>"
+        )
+    return "".join(blocks)
+
+
+def send_digest(config: dict, reports: list[dict], skipped: list[dict], label: str) -> None:
+    if len(reports) == 1 and not skipped:
+        send_report(config, reports[0])
+        return
+    if not reports and not skipped:
+        raise MongoServiceError("보낼 수집 결과가 없습니다.")
+    offline_count = len(skipped)
+    subject = f"[현장 데이터 점검] {label} — {len(reports)}곳 집계"
+    if offline_count:
+        subject += f", {offline_count}곳 오프라인"
+    send_message(config, subject, render_digest_text(reports, skipped), render_digest_html(reports, skipped))
 
 
 def send_test(config: dict) -> None:

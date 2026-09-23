@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 
@@ -8,8 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .config_store import keep_secret, load_config, public_config, save_config
-from .mailer import normalize_recipients, send_report, send_test, validate_delivery
+from .config_store import find_source, keep_secret, load_config, public_config, save_config, sync_active_source
+from .mailer import mail_enabled, normalize_recipients, send_digest, send_test, validate_delivery
 from .mongo_service import (
     MongoServiceError,
     build_report,
@@ -18,6 +19,7 @@ from .mongo_service import (
     list_collections,
     list_databases,
     normalize_host,
+    probe_all,
     scrub_secrets,
     today_in_config,
     validate_field_name,
@@ -27,6 +29,8 @@ from .scheduler import (
     next_run_at,
     read_last_run,
     reschedule,
+    collect_reports,
+    delivery_summary,
     run_report_job,
     start_scheduler,
     stop_scheduler,
@@ -47,6 +51,8 @@ DEV_HINT = """
 
 
 class ConnectionIn(BaseModel):
+    id: str = ""
+    label: str = ""
     host: str
     port: int = 27017
     username: str = ""
@@ -55,20 +61,26 @@ class ConnectionIn(BaseModel):
 
 
 class WatchIn(BaseModel):
+    sourceId: str = ""
     database: str
     collection: str
     timestampField: str
     columns: list[str] = Field(default_factory=list)
 
 
+class ActiveIn(BaseModel):
+    id: str
+
+
 class DeliveryIn(BaseModel):
-    to: list[str] | str
-    smtpHost: str
+    enabled: bool = True
+    to: list[str] | str = ""
+    smtpHost: str = ""
     smtpPort: int = 587
     smtpUser: str = ""
     smtpPassword: str = ""
     fromName: str = "DYP_Schedular"
-    fromAddress: str
+    fromAddress: str = ""
     useTls: bool = True
     period: str = "daily"
     hour: int = 8
@@ -115,25 +127,48 @@ def _status_payload() -> dict:
     }
 
 
-def _apply_connection(payload: ConnectionIn) -> dict:
+def _blank_source() -> dict:
+    return {
+        "id": uuid.uuid4().hex[:12],
+        "label": "",
+        "host": "",
+        "port": 27017,
+        "username": "",
+        "password": "",
+        "authSource": "admin",
+        "database": "",
+        "collection": "",
+        "timestampField": "",
+        "columns": [],
+    }
+
+
+def _apply_connection(payload: ConnectionIn) -> tuple[dict, str, list[str]]:
     config = load_config()
-    current = config["mongodb"]
     if not payload.host.strip():
         raise MongoServiceError("데이터베이스 주소를 입력해 주세요.")
     if not 1 <= payload.port <= 65535:
         raise MongoServiceError("포트 번호를 확인해 주세요.")
     host, port = normalize_host(payload.host.strip(), payload.port)
+    if payload.id:
+        source = find_source(config, payload.id, fallback=False)
+        if source is None:
+            raise MongoServiceError("주소를 찾지 못했습니다.")
+    else:
+        source = _blank_source()
+        config["sources"].append(source)
     uses_uri = host.startswith("mongodb://") or host.startswith("mongodb+srv://")
-    same_account = host == current.get("host") and payload.username.strip() == current.get("username")
+    same_account = host == source.get("host") and payload.username.strip() == (source.get("username") or "")
     password = payload.password
     if payload.username.strip() and not password and same_account:
-        password = keep_secret("", current.get("password") or "")
+        password = keep_secret("", source.get("password") or "")
     if payload.username.strip() and not password and not uses_uri:
         raise MongoServiceError("비밀번호를 입력해 주세요.")
     if not payload.username.strip() and not uses_uri:
         password = ""
-    current.update(
+    source.update(
         {
+            "label": " ".join(payload.label.split()),
             "host": host,
             "port": port,
             "username": payload.username.strip(),
@@ -141,7 +176,10 @@ def _apply_connection(payload: ConnectionIn) -> dict:
             "authSource": (payload.authSource or "admin").strip() or "admin",
         }
     )
-    return config
+    databases = list_databases(config, source)
+    config["activeSourceId"] = source["id"]
+    sync_active_source(config)
+    return config, source["id"], databases
 
 
 @app.get("/api/health")
@@ -158,39 +196,80 @@ def status():
 def setup_connection(payload: ConnectionIn):
     config = None
     try:
-        config = _apply_connection(payload)
-        databases = list_databases(config)
+        config, source_id, databases = _apply_connection(payload)
         save_config(config)
     except MongoServiceError as exc:
         raise _fail(exc, config or load_config()) from exc
-    return {"ok": True, "databases": databases, "status": _status_payload()}
+    return {"ok": True, "sourceId": source_id, "databases": databases, "status": _status_payload()}
+
+
+def _selected_source(config: dict, source_id: str) -> dict:
+    source = find_source(config, source_id or None, fallback=not bool(source_id))
+    if source is None:
+        raise MongoServiceError("데이터베이스 주소를 먼저 연결해 주세요.")
+    return source
+
+
+@app.get("/api/connectivity")
+def connectivity():
+    config = load_config()
+    return probe_all(config)
+
+
+@app.post("/api/sources/active")
+def activate_source(payload: ActiveIn):
+    config = load_config()
+    source = find_source(config, payload.id, fallback=False)
+    if source is None:
+        raise HTTPException(status_code=404, detail="주소를 찾지 못했습니다.")
+    config["activeSourceId"] = source["id"]
+    sync_active_source(config)
+    save_config(config)
+    return {"ok": True, "status": _status_payload()}
+
+
+@app.delete("/api/sources/{source_id}")
+def delete_source(source_id: str):
+    config = load_config()
+    sources = list(config.get("sources") or [])
+    if len(sources) <= 1:
+        raise HTTPException(status_code=400, detail="주소는 하나 이상 남겨 주세요.")
+    remaining = [item for item in sources if item.get("id") != source_id]
+    if len(remaining) == len(sources):
+        raise HTTPException(status_code=404, detail="주소를 찾지 못했습니다.")
+    config["sources"] = remaining
+    if config.get("activeSourceId") == source_id:
+        config["activeSourceId"] = remaining[0]["id"]
+    sync_active_source(config)
+    save_config(config)
+    return {"ok": True, "status": _status_payload()}
 
 
 @app.get("/api/mongo/databases")
-def mongo_databases():
+def mongo_databases(sourceId: str = ""):
     config = load_config()
     try:
-        databases = list_databases(config)
+        databases = list_databases(config, _selected_source(config, sourceId))
     except MongoServiceError as exc:
         raise _fail(exc, config) from exc
     return {"databases": databases}
 
 
 @app.get("/api/mongo/collections")
-def mongo_collections(database: str):
+def mongo_collections(database: str, sourceId: str = ""):
     config = load_config()
     try:
-        collections = list_collections(config, database)
+        collections = list_collections(config, database, _selected_source(config, sourceId))
     except MongoServiceError as exc:
         raise _fail(exc, config) from exc
     return {"collections": collections}
 
 
 @app.get("/api/mongo/fields")
-def mongo_fields(database: str, collection: str):
+def mongo_fields(database: str, collection: str, sourceId: str = ""):
     config = load_config()
     try:
-        inspected = inspect_fields(config, database, collection)
+        inspected = inspect_fields(config, database, collection, source=_selected_source(config, sourceId))
     except MongoServiceError as exc:
         raise _fail(exc, config) from exc
     return inspected
@@ -200,6 +279,7 @@ def mongo_fields(database: str, collection: str):
 def setup_watch(payload: WatchIn):
     config = load_config()
     try:
+        source = _selected_source(config, payload.sourceId)
         database = payload.database.strip()
         collection = payload.collection.strip()
         timestamp_field = validate_field_name(payload.timestampField)
@@ -216,12 +296,14 @@ def setup_watch(payload: WatchIn):
             raise MongoServiceError("한 번에 확인할 수 있는 컬럼은 200개까지입니다.")
     except MongoServiceError as exc:
         raise _fail(exc, config) from exc
-    config["mongodb"]["database"] = database
-    config["mongodb"]["collection"] = collection
-    config["timestampField"] = timestamp_field
-    config["columns"] = columns
+    source["database"] = database
+    source["collection"] = collection
+    source["timestampField"] = timestamp_field
+    source["columns"] = columns
+    config["activeSourceId"] = source["id"]
+    sync_active_source(config)
     save_config(config)
-    return {"ok": True, "status": _status_payload()}
+    return {"ok": True, "sourceId": source["id"], "status": _status_payload()}
 
 
 def _apply_delivery(config: dict, payload: DeliveryIn) -> dict:
@@ -231,22 +313,24 @@ def _apply_delivery(config: dict, payload: DeliveryIn) -> dict:
         raise MongoServiceError("발송 시각을 확인해 주세요.")
     if payload.weekday not in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}:
         raise MongoServiceError("발송 요일을 확인해 주세요.")
-    if not 1 <= payload.smtpPort <= 65535:
-        raise MongoServiceError("SMTP 포트를 확인해 주세요.")
     email = config["email"]
-    email.update(
-        {
-            "to": normalize_recipients(payload.to),
-            "smtpHost": payload.smtpHost.strip(),
-            "smtpPort": payload.smtpPort,
-            "smtpUser": payload.smtpUser.strip(),
-            "smtpPassword": keep_secret(payload.smtpPassword, email.get("smtpPassword") or ""),
-            "fromName": " ".join(payload.fromName.split()) or "DYP_Schedular",
-            "fromAddress": payload.fromAddress.strip(),
-            "useTls": payload.useTls,
-        }
-    )
-    validate_delivery(email)
+    email["enabled"] = payload.enabled
+    if payload.enabled:
+        if not 1 <= payload.smtpPort <= 65535:
+            raise MongoServiceError("SMTP 포트를 확인해 주세요.")
+        email.update(
+            {
+                "to": normalize_recipients(payload.to),
+                "smtpHost": payload.smtpHost.strip(),
+                "smtpPort": payload.smtpPort,
+                "smtpUser": payload.smtpUser.strip(),
+                "smtpPassword": keep_secret(payload.smtpPassword, email.get("smtpPassword") or ""),
+                "fromName": " ".join(payload.fromName.split()) or "DYP_Schedular",
+                "fromAddress": payload.fromAddress.strip(),
+                "useTls": payload.useTls,
+            }
+        )
+        validate_delivery(email)
     config["schedule"].update(
         {
             "period": payload.period,
@@ -274,6 +358,8 @@ def setup_delivery(payload: DeliveryIn):
 
 @app.post("/api/mail/test")
 def mail_test(payload: DeliveryIn):
+    if not payload.enabled:
+        raise HTTPException(status_code=400, detail="메일 전송을 사용하지 않는 설정입니다.")
     config = load_config()
     try:
         _apply_delivery(config, payload)
@@ -287,13 +373,14 @@ def mail_test(payload: DeliveryIn):
 def report(
     date_value: str | None = Query(default=None, alias="date"),
     span: str | None = None,
+    source_id: str | None = Query(default=None, alias="source"),
 ):
     config = load_config()
     if not config.get("setupComplete"):
         raise HTTPException(status_code=400, detail="설정을 먼저 마무리해 주세요.")
     end_date = _parse_date(date_value) if date_value else default_end_date(config)
     try:
-        return build_report(config, end_date=end_date, span=span)
+        return build_report(config, end_date=end_date, span=span, source_id=source_id)
     except MongoServiceError as exc:
         raise _fail(exc, config) from exc
 
@@ -302,17 +389,21 @@ def report(
 def report_send(
     date_value: str | None = Query(default=None, alias="date"),
     span: str | None = None,
+    source_id: str | None = Query(default=None, alias="source"),
 ):
     config = load_config()
     if not config.get("setupComplete"):
         raise HTTPException(status_code=400, detail="설정을 먼저 마무리해 주세요.")
+    if not mail_enabled(config):
+        raise HTTPException(status_code=400, detail="메일 전송을 사용하지 않는 설정입니다.")
     end_date = _parse_date(date_value) if date_value else default_end_date(config)
     try:
-        built = build_report(config, end_date=end_date, span=span)
-        send_report(config, built)
+        reports, skipped, label = collect_reports(config, end_date, span)
+        send_digest(config, reports, skipped, label)
     except MongoServiceError as exc:
         raise _fail(exc, config) from exc
-    write_last_run(ok=True, report=built, error=None, manual=True)
+    built = next((item for item in reports if item.get("sourceId") == source_id), reports[0] if reports else None)
+    write_last_run(ok=True, report=delivery_summary(reports, skipped, label, end_date.isoformat()), error=None, manual=True)
     return {"ok": True, "report": built, "status": _status_payload()}
 
 

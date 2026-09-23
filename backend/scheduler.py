@@ -7,9 +7,9 @@ from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from .config_store import load_config
-from .mailer import send_report
-from .mongo_service import MongoServiceError, build_report, default_end_date, scrub_secrets
+from .config_store import find_source, load_config
+from .mailer import mail_enabled, send_digest
+from .mongo_service import MongoServiceError, build_report, default_end_date, probe_all, resolve_window, scrub_secrets
 from .paths import runtime_dir
 
 logger = logging.getLogger("data_scheduler")
@@ -52,16 +52,65 @@ def write_last_run(*, ok: bool, report: dict | None, error: str | None, manual: 
     temporary.replace(path)
 
 
+def collect_reports(config: dict, end_date, span: str | None = None) -> tuple[list[dict], list[dict], str]:
+    _start, _end, label = resolve_window(config, end_date, span)
+    snapshot = probe_all(config)
+    reports = []
+    skipped = []
+    ready = False
+    for row in snapshot["sources"]:
+        source = find_source(config, row.get("id"), fallback=False)
+        if source is None:
+            continue
+        if not source.get("database") or not source.get("collection") or not source.get("columns"):
+            skipped.append({**row, "online": False, "error": "데이터베이스와 확인 컬럼이 없습니다."})
+            continue
+        ready = True
+        if not row.get("online"):
+            skipped.append(row)
+            continue
+        try:
+            reports.append(build_report(config, end_date=end_date, span=span, source_id=source["id"]))
+        except MongoServiceError as exc:
+            skipped.append({**row, "online": False, "error": str(exc)})
+    if not ready:
+        raise MongoServiceError("확인할 주소를 하나 이상 설정해 주세요.")
+    return reports, skipped, label
+
+
+def delivery_summary(reports: list[dict], skipped: list[dict], label: str, covered_end: str) -> dict:
+    if reports:
+        status = reports[0]["status"]
+        total = sum(int(item.get("totalDocuments") or 0) for item in reports)
+        covered = reports[0]["window"].get("coveredEnd") or covered_end
+    else:
+        status = "empty"
+        total = 0
+        covered = covered_end
+    if skipped and status == "ok":
+        status = "partial"
+    return {
+        "window": {"label": label, "coveredEnd": covered},
+        "status": status,
+        "totalDocuments": total,
+    }
+
+
 def run_report_job(manual: bool = False) -> bool:
     config = load_config()
     if not config.get("setupComplete"):
         write_last_run(ok=False, report=None, error="설정이 끝나지 않았습니다.", manual=manual)
         return False
+    if not mail_enabled(config):
+        logger.info("메일 전송을 사용하지 않아 발송을 건너뛰었습니다.")
+        return True
+    end_date = default_end_date(config)
     try:
-        report = build_report(config, end_date=default_end_date(config))
-        send_report(config, report)
-        write_last_run(ok=True, report=report, error=None, manual=manual)
-        logger.info("리포트를 발송했습니다. %s", report["window"]["label"])
+        reports, skipped, label = collect_reports(config, end_date)
+        send_digest(config, reports, skipped, label)
+        summary = delivery_summary(reports, skipped, label, end_date.isoformat())
+        write_last_run(ok=True, report=summary, error=None, manual=manual)
+        logger.info("리포트를 발송했습니다. %s", label)
         return True
     except Exception as exc:
         message = scrub_secrets(str(exc), config)
@@ -89,7 +138,7 @@ def reschedule() -> None:
     if existing:
         _scheduler.remove_job("field-report")
     config = load_config()
-    if not config.get("setupComplete"):
+    if not config.get("setupComplete") or not mail_enabled(config):
         return
     schedule = config["schedule"]
     timezone_name = schedule.get("timezone") or "Asia/Seoul"

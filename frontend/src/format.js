@@ -58,7 +58,17 @@ export function toTimeValue(hour = 8, minute = 0) {
   return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
-export function scheduleSentence(schedule, recipients) {
+export function formatSource(source) {
+  if (!source) return "주소 없음";
+  const host = source.host || "";
+  const address = host.startsWith("mongodb") ? host : `${host}:${source.port || 27017}`;
+  const name = (source.label || "").trim();
+  if (name && name !== host && name !== address) return `${name} · ${address}`;
+  return address;
+}
+
+export function scheduleSentence(schedule, recipients, mailEnabled = true) {
+  if (!mailEnabled) return "메일 전송은 꺼 두었습니다. 수집 결과는 이 화면에서 확인합니다.";
   const time = toTimeValue(schedule.hour, schedule.minute);
   const target = recipients.length ? recipients.join(", ") : "받는 사람 없음";
   if (schedule.period === "weekly") {

@@ -8,6 +8,22 @@
     "database": "field",
     "collection": "sensors"
   },
+  "sources": [
+    {
+      "id": "primary",
+      "label": "현장",
+      "host": "127.0.0.1",
+      "port": 27017,
+      "username": "field_user",
+      "password": "",
+      "authSource": "admin",
+      "database": "field",
+      "collection": "sensors",
+      "timestampField": "createdAt",
+      "columns": ["temperature", "humidity"]
+    }
+  ],
+  "activeSourceId": "primary",
   "timestampField": "createdAt",
   "columns": ["temperature", "humidity"],
   "schedule": {
@@ -18,6 +34,7 @@
     "timezone": "Asia/Seoul"
   },
   "email": {
+    "enabled": true,
     "to": ["ops@example.com"],
     "smtpHost": "smtp.example.com",
     "smtpPort": 587,

@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import json
+import socket
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from time import perf_counter
 from typing import Iterator
 from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
+
+from .config_store import find_source, source_label
 
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.errors import PyMongoError
 
 SYSTEM_DATABASES = {"admin", "local", "config"}
+VALUE_LIMIT = 40
 
 
 class MongoServiceError(Exception):
@@ -19,18 +26,22 @@ class MongoServiceError(Exception):
 
 def scrub_secrets(message: str, config: dict) -> str:
     text = message
-    mongo = config.get("mongodb", {})
     mail = config.get("email", {})
     secrets = []
-    for secret in (mongo.get("password"), mail.get("smtpPassword"), mongo.get("username")):
+    accounts = [config.get("mongodb") or {}, *(config.get("sources") or [])]
+    for account in accounts:
+        secrets.extend((account.get("password"), account.get("username")))
+    secrets.append(mail.get("smtpPassword"))
+    hidden = []
+    for secret in secrets:
         if not secret:
             continue
         value = str(secret)
-        secrets.append(value)
+        hidden.append(value)
         encoded = quote_plus(value)
         if encoded != value:
-            secrets.append(encoded)
-    for secret in secrets:
+            hidden.append(encoded)
+    for secret in hidden:
         text = text.replace(secret, "******")
     return text
 
@@ -80,9 +91,9 @@ def _client_options(uri: str) -> dict:
 
 
 @contextmanager
-def connect(config: dict) -> Iterator[MongoClient]:
-    mongo = config["mongodb"]
-    if not str(mongo.get("host") or "").strip():
+def connect(config: dict, source: dict | None = None) -> Iterator[MongoClient]:
+    mongo = source or find_source(config)
+    if mongo is None or not str(mongo.get("host") or "").strip():
         raise MongoServiceError("데이터베이스 주소를 입력해 주세요.")
     uri = build_uri(mongo)
     client = MongoClient(uri, **_client_options(uri))
@@ -95,16 +106,16 @@ def connect(config: dict) -> Iterator[MongoClient]:
         client.close()
 
 
-def list_databases(config: dict) -> list[str]:
-    with connect(config) as client:
+def list_databases(config: dict, source: dict | None = None) -> list[str]:
+    with connect(config, source) as client:
         names = client.list_database_names()
     return sorted(name for name in names if name not in SYSTEM_DATABASES)
 
 
-def list_collections(config: dict, database: str) -> list[str]:
+def list_collections(config: dict, database: str, source: dict | None = None) -> list[str]:
     if not database:
         raise MongoServiceError("데이터베이스를 선택해 주세요.")
-    with connect(config) as client:
+    with connect(config, source) as client:
         if database not in client.list_database_names():
             raise MongoServiceError(f"데이터베이스 '{database}'을 찾지 못했습니다.")
         names = client[database].list_collection_names()
@@ -146,10 +157,16 @@ def _walk(document: dict, prefix: str, found: dict[str, dict], depth: int) -> No
             _walk(value, name, found, depth + 1)
 
 
-def inspect_fields(config: dict, database: str, collection: str, sample_size: int = 80) -> dict:
+def inspect_fields(
+    config: dict,
+    database: str,
+    collection: str,
+    sample_size: int = 80,
+    source: dict | None = None,
+) -> dict:
     if not database or not collection:
         raise MongoServiceError("데이터베이스와 컬렉션을 선택해 주세요.")
-    with connect(config) as client:
+    with connect(config, source) as client:
         coll = client[database][collection]
         documents = list(coll.find().sort("_id", -1).limit(sample_size))
     found: dict[str, dict] = {}
@@ -261,7 +278,24 @@ def _match_and_date_expr(field: str, mode: str, start: datetime, end: datetime):
             }
         }
         return match, expr
-    return {field: {"$gte": start, "$lt": end}}, f"${field}"
+    # 시간대 없이 저장된 시각은 적힌 날짜 그대로 자른다.
+    # 서울 시각으로 바꾸면 하루가 9시간 밀려 고른 날짜와 어긋난다.
+    return {field: {"$gte": start.replace(tzinfo=None), "$lt": end.replace(tzinfo=None)}}, f"${field}"
+
+
+def format_stored_value(value) -> str:
+    if value is None:
+        return "빈 값"
+    if isinstance(value, bool):
+        return "예" if value else "아니오"
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ", timespec="seconds")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, default=str)
+        return text if len(text) <= 80 else f"{text[:77]}..."
+    return str(value)
 
 
 def _present_expr(field: str) -> dict:
@@ -304,14 +338,68 @@ def _bucket_pipeline(date_expr, timezone_name: str, daily: bool) -> list[dict]:
     ]
 
 
-def build_report(config: dict, end_date: date | None = None, span: str | None = None) -> dict:
-    mongo = config["mongodb"]
-    database = mongo.get("database") or ""
-    collection_name = mongo.get("collection") or ""
-    if not str(config.get("timestampField") or "").strip():
+def internet_reachable(config: dict | None = None) -> bool:
+    targets = [("1.1.1.1", 443), ("8.8.8.8", 53)]
+    email = (config or {}).get("email") or {}
+    smtp_host = str(email.get("smtpHost") or "").strip()
+    if email.get("enabled", True) and smtp_host:
+        targets.append((smtp_host, int(email.get("smtpPort") or 587)))
+    for host, port in targets:
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def probe_source(config: dict, source: dict) -> dict:
+    started = perf_counter()
+    error = None
+    online = False
+    try:
+        with connect(config, source):
+            online = True
+    except MongoServiceError as exc:
+        error = str(exc)
+    return {
+        "id": source.get("id"),
+        "label": source_label(source),
+        "host": source.get("host") or "",
+        "port": int(source.get("port") or 27017),
+        "database": source.get("database") or "",
+        "collection": source.get("collection") or "",
+        "online": online,
+        "error": error,
+        "latencyMs": int((perf_counter() - started) * 1000),
+    }
+
+
+def probe_all(config: dict) -> dict:
+    sources = list(config.get("sources") or [])
+    workers = max(len(sources) + 1, 1)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        internet_future = pool.submit(internet_reachable, config)
+        probed = list(pool.map(lambda source: probe_source(config, source), sources))
+        internet = internet_future.result()
+    return {"internet": internet, "sources": probed}
+
+
+def build_report(
+    config: dict,
+    end_date: date | None = None,
+    span: str | None = None,
+    source_id: str | None = None,
+) -> dict:
+    source = find_source(config, source_id, fallback=not bool(source_id))
+    if source is None:
+        raise MongoServiceError("데이터베이스 주소를 선택해 주세요.")
+    database = source.get("database") or ""
+    collection_name = source.get("collection") or ""
+    if not str(source.get("timestampField") or "").strip():
         raise MongoServiceError("시간 기준 컬럼을 선택해 주세요.")
-    timestamp_field = validate_field_name(config["timestampField"])
-    columns = [validate_field_name(name) for name in config.get("columns") or []]
+    timestamp_field = validate_field_name(source["timestampField"])
+    columns = [validate_field_name(name) for name in source.get("columns") or []]
     if not columns:
         raise MongoServiceError("확인할 컬럼을 하나 이상 선택해 주세요.")
     if timestamp_field in columns:
@@ -325,43 +413,81 @@ def build_report(config: dict, end_date: date | None = None, span: str | None = 
     timezone_name = config.get("schedule", {}).get("timezone") or "Asia/Seoul"
     daily = (end - start) <= timedelta(days=1)
 
-    with connect(config) as client:
+    with connect(config, source) as client:
         database_handle = client[database]
         if collection_name not in database_handle.list_collection_names():
             raise MongoServiceError(f"컬렉션 '{collection_name}'을 찾지 못했습니다.")
         coll = database_handle[collection_name]
         mode = detect_timestamp_mode(coll, timestamp_field)
         match, date_expr = _match_and_date_expr(timestamp_field, mode, start, end)
+        bucket_timezone = "UTC" if mode == "datetime" else timezone_name
         indexed = _timestamp_indexed(coll, timestamp_field)
 
         summary_group: dict = {"_id": None}
         for index, name in enumerate(columns):
             summary_group[f"c{index}"] = {"$sum": {"$cond": [_present_expr(name), 1, 0]}}
 
-        pipeline = [
-            {"$match": match},
-            {
-                "$facet": {
-                    "summary": [{"$group": {**summary_group, "total": {"$sum": 1}}}],
-                    "buckets": _bucket_pipeline(date_expr, timezone_name, daily),
-                    "bounds": [
-                        {
-                            "$group": {
-                                "_id": None,
-                                "first": {"$min": date_expr},
-                                "last": {"$max": date_expr},
-                            }
-                        }
-                    ],
+        facet: dict = {
+            "summary": [{"$group": {**summary_group, "total": {"$sum": 1}}}],
+            "buckets": _bucket_pipeline(date_expr, bucket_timezone, daily),
+            "bounds": [
+                {
+                    "$group": {
+                        "_id": None,
+                        "first": {"$min": date_expr},
+                        "last": {"$max": date_expr},
+                    }
                 }
-            },
-        ]
+            ],
+        }
+        for index, name in enumerate(columns):
+            facet[f"v{index}"] = [
+                {"$group": {"_id": {"$ifNull": [f"${name}", None]}, "count": {"$sum": 1}}},
+                {"$sort": {"count": -1, "_id": 1}},
+                {"$limit": VALUE_LIMIT + 1},
+            ]
+        pipeline = [{"$match": match}, {"$facet": facet}]
         try:
             aggregated = list(coll.aggregate(pipeline, maxTimeMS=60_000))
         except PyMongoError as exc:
             raise MongoServiceError(
                 f"수집량을 계산하지 못했습니다. {scrub_secrets(str(exc), config)}"
             ) from exc
+
+        facet = aggregated[0] if aggregated else {}
+        summary_preview = (facet.get("summary") or [{}])[0]
+        active_dates: list[dict] = []
+        if not int(summary_preview.get("total") or 0):
+            try:
+                date_rows = list(
+                    coll.aggregate(
+                        [
+                            {
+                                "$group": {
+                                    "_id": {
+                                        "$dateToString": {
+                                            "format": "%Y-%m-%d",
+                                            "date": f"${timestamp_field}",
+                                            "timezone": "UTC",
+                                        }
+                                    },
+                                    "count": {"$sum": 1},
+                                }
+                            },
+                            {"$sort": {"_id": 1}},
+                        ],
+                        maxTimeMS=120_000,
+                    )
+                )
+            except PyMongoError as exc:
+                raise MongoServiceError(
+                    f"데이터가 있는 날짜를 찾지 못했습니다. {scrub_secrets(str(exc), config)}"
+                ) from exc
+            active_dates = [
+                {"date": row.get("_id"), "count": int(row.get("count") or 0)}
+                for row in date_rows
+                if row.get("_id")
+            ]
 
     facet = aggregated[0] if aggregated else {}
     summary_rows = facet.get("summary") or []
@@ -372,6 +498,18 @@ def build_report(config: dict, end_date: date | None = None, span: str | None = 
         present = int(summary.get(f"c{index}") or 0)
         missing = max(total - present, 0)
         fill_rate = (present / total) if total else 0
+        raw_values = facet.get(f"v{index}") or []
+        truncated = len(raw_values) > VALUE_LIMIT
+        values = []
+        for item in raw_values[:VALUE_LIMIT]:
+            count = int(item.get("count") or 0)
+            values.append(
+                {
+                    "value": format_stored_value(item.get("_id")),
+                    "count": count,
+                    "rate": round((count / total), 4) if total else 0,
+                }
+            )
         column_rows.append(
             {
                 "name": name,
@@ -379,6 +517,8 @@ def build_report(config: dict, end_date: date | None = None, span: str | None = 
                 "missing": missing,
                 "fillRate": round(fill_rate, 4),
                 "status": _column_status(total, fill_rate),
+                "values": values,
+                "valuesTruncated": truncated,
             }
         )
 
@@ -398,6 +538,8 @@ def build_report(config: dict, end_date: date | None = None, span: str | None = 
     bounds = (facet.get("bounds") or [{}])[0]
     average = round(sum(row["fillRate"] for row in column_rows) / len(column_rows), 4) if column_rows else 0
     return {
+        "sourceId": source.get("id"),
+        "sourceLabel": source_label(source),
         "window": {
             "start": start.isoformat(),
             "end": end.isoformat(),
@@ -418,6 +560,7 @@ def build_report(config: dict, end_date: date | None = None, span: str | None = 
         "buckets": buckets,
         "firstAt": _iso(bounds.get("first")),
         "lastAt": _iso(bounds.get("last")),
+        "activeDates": active_dates,
     }
 
 
